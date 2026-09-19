@@ -16,7 +16,7 @@ use crate::{Chip, EPS};
 // Columns inside the contraction: Ut / Dt count the 64-column packets of an up/gate row (3840
 // columns) or of a down half-row (7680), Xp is the packet. Sb / Sd are the 16-column blocks of a
 // row (240) or of a half-row (480): the block sums and the block scales are indexed by them.
-axes![Rep8 = 8, Q4 = 4, Rep32 = 32, Ring8 = 8, T2 = 2, Xh = 3840, Rep4 = 4, Ring64 = 64, Xg = 120, Xd = 7680, Ut = 60, Dt = 120, Xp = 64, C2 = 2, Lead4 = 4, Hg = 128, Pw = 64, Sb = 240, Sd = 480];
+axes![Rep8 = 8, Q4 = 4, Rep32 = 32, Ring8 = 8, T2 = 2, Xh = 3840, Rep4 = 4, Ring64 = 64, Xg = 120, Xd = 7680, Ut = 60, Dt = 120, Xp = 64, C2 = 2, Lead4 = 4, Hg = 128, Pw = 64, Sb = 240, Sd = 480, Slot = 2];
 
 const H_F32: f32 = H::SIZE as f32;
 const INVSQRT2: f32 = 0.70710678118f32;
@@ -49,7 +49,7 @@ fn normalize_quantize(
     ctx: &mut Context,
     x: &HbmTensor<bf16, Chip, m![H]>,
     rms_weight: &HbmTensor<bf16, Chip, m![H]>,
-) -> (TrfTensor<f8e4m3, Chip, UpGateClusters, Gathered, m![1], m![T2, Ut, Xp]>, DmTensor<bf16, Chip, UpGateClusters, Pieces, m![H % 480]>) {
+) -> (TrfTensor<f8e4m3, Chip, UpGateClusters, Gathered, m![1], m![T2, Ut, Xp]>, DmTensor<bf16, Chip, UpGateClusters, Pieces, m![Slot, H % 480]>) {
     // WARM-UP. The first Sub command of this kernel costs ~10x its model cycles (2,696 device for a
     // 267-cycle StoVrf) and the ISSUER stalls on it, which is why the DMA idles 2,464 cycles between
     // the norm-weight load and the decode-table load and the up weight load starts at 9,209 instead
@@ -63,13 +63,22 @@ fn normalize_quantize(
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
 
-    let x: DmTensor<bf16, Chip, UpGateClusters, Loaded, m![H % 480]> = x.to_dm(&mut ctx.tdma);
-    let x: DmTensor<bf16, Chip, UpGateClusters, Pieces, m![H % 480]> = unsafe { x.reshape() };
+    // POOL TILE CHAIN (BRIEF2 UPDATE 14 / 47, the qkv lever): the rms weight and the hidden state
+    // are two TILES of ONE DM tensor and the WEIGHT is written first, so the x load carries a real
+    // DMA -> DMA dependency and the scheduler lists the RMSNorm chain one DMA slot later.
+    let mut xpool: DmTensor<bf16, Chip, UpGateClusters, Loaded, m![Slot, H % 480]> = DmTensor::new();
+    {
+        let w = unsafe { rms_weight.view().reshape::<Chip, m![Slot = 1, H]>() };
+        w.to_dm_view(&mut ctx.tdma, xpool.view_mut().tile::<m![Slot], 1, m![Slot = 1 #{!} 2, H % 480]>(1));
+        let xv = unsafe { x.view().reshape::<Chip, m![Slot = 1, H]>() };
+        xv.to_dm_view(&mut ctx.tdma, xpool.view_mut().tile::<m![Slot], 1, m![Slot = 1 #{!} 2, H % 480]>(0));
+    }
+    let xpool: DmTensor<bf16, Chip, UpGateClusters, Pieces, m![Slot, H % 480]> = unsafe { xpool.reshape() };
 
     let mean_square: DmTensor<f32, Chip, UpGateClusters, Pieces, m![1 # 8]> = ctx
         .main
-        .begin(x.view())
-        .fetch::<m![H / 16 % 30], m![H % 16]>()
+        .begin(xpool.view().tile::<m![Slot], 1, m![Slot = 1 # 2, H % 480]>(0))
+        .fetch::<m![Slot = 1, H / 16 % 30], m![H % 16]>()
         .fetch_cast::<f32>()
         .collect::<m![H / 8 % 60], m![H % 8]>()
         .vector_init()
@@ -100,12 +109,10 @@ fn normalize_quantize(
         .commit();
     let rms: DmTensor<f32, Chip, UpGateClusters, Pieces, m![1 # 8]> = unsafe { rms.reshape() };
 
-    let weight_dm: DmTensor<bf16, Chip, UpGateClusters, Loaded, m![H % 480]> = rms_weight.to_dm(&mut ctx.tdma);
-    let weight_dm: DmTensor<bf16, Chip, UpGateClusters, Pieces, m![H % 480]> = unsafe { weight_dm.reshape() };
     let weight_vrf: VrfTensor<f32, Chip, UpGateClusters, Pieces, m![H % 480]> = ctx
         .sub
-        .begin(weight_dm.view())
-        .fetch::<m![H / 16 % 30], m![H % 16]>()
+        .begin(xpool.view().tile::<m![Slot], 1, m![Slot = 1 # 2, H % 480]>(1))
+        .fetch::<m![Slot = 1, H / 16 % 30], m![H % 16]>()
         .fetch_cast::<f32>()
         .collect::<m![H / 8 % 60], m![H % 8]>()
         .to_vrf();
@@ -117,8 +124,8 @@ fn normalize_quantize(
         .to_vrf();
     let normalized: DmTensor<bf16, Chip, UpGateClusters, Pieces, m![H % 480]> = ctx
         .main
-        .begin(x.view())
-        .fetch::<m![H / 16 % 30], m![H % 16]>()
+        .begin(xpool.view().tile::<m![Slot], 1, m![Slot = 1 # 2, H % 480]>(0))
+        .fetch::<m![Slot = 1, H / 16 % 30], m![H % 16]>()
         .fetch_cast::<f32>()
         .collect::<m![H / 8 % 60], m![H % 8]>()
         .vector_init()
@@ -200,7 +207,7 @@ fn normalize_quantize(
         .fetch::<m![T2, Ut, Xp / 32], m![Xp % 32]>()
         .collect::<m![T2, Ut, Xp / 32], m![Xp % 32]>()
         .to_trf();
-    (x_trf, x)
+    (x_trf, xpool)
 }
 
 /// A whole up or gate matrix (30 whole rows a slice) in ONE pass, one decode table: per-block sums
@@ -523,11 +530,11 @@ pub(crate) fn feedforward(
     up_global_scale: &HbmTensor<f32, Chip, m![1]>,
     gate_global_scale: &HbmTensor<f32, Chip, m![1]>,
     down_global_scale: &HbmTensor<f32, Chip, m![1]>,
-) -> (DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]>, DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]>) {
+) -> (DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]>, DmTensor<bf16, Chip, Cluster, ReducingSlices, m![Slot, H % 480]>) {
     let (x_trf, residual_pieces) = normalize_quantize(ctx, residual, pre_ff_rms_weight);
     // The input was loaded as 32 real copies of eight 480-column pieces: copy 0 of cluster 0 IS the
     // residual spread over the eight reducing slices, byte for byte (real data viewed as padded).
-    let residual_spread: DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]> =
+    let residual_spread: DmTensor<bf16, Chip, Cluster, ReducingSlices, m![Slot, H % 480]> =
         unsafe { residual_pieces.reshape() };
 
     let up_z = block_sums_all!(ctx, up_weight_packed, x_trf);
@@ -626,7 +633,7 @@ pub(crate) fn normalize_add_gate_in_place(
     ctx: &mut Context,
     x: &DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]>,
     rms_weight: &HbmTensor<bf16, Chip, m![H]>,
-    residual_dm: &DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]>,
+    residual_dm: &DmTensor<bf16, Chip, Cluster, ReducingSlices, m![Slot, H % 480]>,
     layer_scalar: &HbmTensor<bf16, Chip, m![1 # 8]>,
 ) -> DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]> {
     let mean_square: DmTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = ctx
@@ -679,8 +686,8 @@ pub(crate) fn normalize_add_gate_in_place(
         .to_vrf();
     let residual_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![H % 480]> = ctx
         .sub
-        .begin(residual_dm.view())
-        .fetch::<m![H / 16 % 30], m![H % 16]>()
+        .begin(residual_dm.view().tile::<m![Slot], 1, m![Slot = 1 # 2, H % 480]>(0))
+        .fetch::<m![Slot = 1, H / 16 % 30], m![H % 16]>()
         .fetch_cast::<f32>()
         .collect::<m![H / 8 % 60], m![H % 8]>()
         .to_vrf();
