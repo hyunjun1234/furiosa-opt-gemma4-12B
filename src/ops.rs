@@ -58,6 +58,10 @@ pub fn sliding_project_qkv(
 ) {
     use crate::device::qkv::{self, Term};
 
+    // The issuer stalls on this kernel's FIRST Sub command (~10x its model cycles). Paid here,
+    // off the critical chain, so the Q weight is not held back by it. See `qkv::warm_up`.
+    qkv::warm_up(ctx);
+
     // Every small load (row scales, head-norm weights, later the parked RoPE rows) is a tile of
     // ONE pool tensor: tile writes are chained in program order and a tile read depends on the
     // writes before it in program order. The RoPE rows are written LAST, after K's head has been

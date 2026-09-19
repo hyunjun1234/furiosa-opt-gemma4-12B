@@ -45,4 +45,23 @@ pub(crate) type HeadCopySlices = m![HeadCopy4, 1 # 64];
 /// terms, and the projections divided by it again (both exact). It lifts the residual term
 /// x - f8(x), which is |x| / 16 .. |x| / 256, out of f8e4m3's subnormal range (below 2^-6) for
 /// |x| around 1; |x| up to 448 / 8 = 56 still fits the first term.
+/// A first Sub command that depends on nothing, so the issuer can hand it over at once.
+///
+/// The FIRST Sub command of a kernel costs about ten times its model cycles and the ISSUER STALLS
+/// on it (`shared/ffn7.rs:53`, which pays the same toll and was given the same warm-up in 0ac3a19).
+/// In qkv the toll lands between the small head loads and the Q weight: the device trace has the
+/// DMA idle 5,980..8,813 while the xnorm passes run, and the 13,791-cycle Q weight starts 2,833
+/// late. This command reads a fresh tensor whose value is never used; it exists only to take the
+/// toll off the critical chain.
+pub(crate) fn warm_up(ctx: &mut Context) {
+    use crate::Chip;
+    let warm: DmTensor<f32, Chip, HeadClusters, HeadSlices, m![1 # 8]> = DmTensor::new();
+    let _warm: VrfTensor<f32, Chip, HeadClusters, HeadSlices, m![1 # 8]> = ctx
+        .sub
+        .begin(warm.view())
+        .fetch::<m![1], m![1 # 8]>()
+        .collect::<m![1], m![1 # 8]>()
+        .to_vrf();
+}
+
 pub(crate) const X_PRESCALE: f32 = 8.0;
