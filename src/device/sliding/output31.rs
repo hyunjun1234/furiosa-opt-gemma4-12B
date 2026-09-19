@@ -12,11 +12,10 @@
 //!     The stage order is Fp -> IntraSliceReduce -> FpDiv, so the root (Fp, FpFpu) and the division
 //!     (a separate stage) live in ONE pass. That pass writes eight values per slice, so whatever the
 //!     divider costs per element it costs it 8 times instead of 240 times.
-//!   * the final pass then needs THREE multiplies (s, 1/rms, w) and the vector engine has two
-//!     (`Mul0`, `Mul1`), so `sw = s * w` is precomputed in one small pass placed between the hop
-//!     store and the reload -- i.e. inside the cross-cluster sync's wait, where the machine is idle
-//!     anyway (the sync span ends when everything already issued has finished, so this work is
-//!     free and it shortens the exposed part of the wait).
+//!   * the final pass then needs THREE multiplies (s, 1/rms, w) and the vector engine has THREE
+//!     multiply ALUs -- `FpMul0`, `FpMul1` and `FpFma` -- so all three ride one pass. The module
+//!     used to precompute `sw = s * w` because its author believed there were only two; that pass
+//!     and the `to_vrf` that read it back are gone.
 //! The sum of squares pass still needs `s` on its own, so the channel-scale VRF stays.
 
 use furiosa_opt_std::prelude::*;
@@ -219,30 +218,6 @@ pub(crate) fn project_normalize_add(
     pool_load(ctx, &mut pool, rms_weight, 2);
     let rms_weight = pool_vrf(ctx, &pool, 2);
 
-    // sw = channel scale * RMSNorm weight, so that the final pass needs only two multiplies
-    // (`sw` and `1 / rms`) and no division. Listed before the reload: the issuer hands it over
-    // during the cross-cluster sync's wait, where both the DMA and the tensor unit are idle.
-    let sw_dm: TailDm<f32> = ctx
-        .main
-        .begin(pool.view().tile::<m![Zp], 1, m![Zp = 1 # 3, H % 240]>(1))
-        .fetch::<m![Zp = 1], m![H % 240]>()
-        .fetch_cast::<f32>()
-        .collect::<m![H / 8 % 30], m![H % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<m![H / 4 % 60], m![H % 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &rms_weight)
-        .vector_widen_concat::<m![H / 8 % 30], m![H % 8]>()
-        .vector_final()
-        .commit_trim::<m![H % 8]>()
-        .commit();
-    let sw: TailVrf = ctx
-        .sub
-        .begin(sw_dm.view())
-        .fetch::<m![1], m![H % 240]>()
-        .collect::<m![H / 8 % 30], m![H % 8]>()
-        .to_vrf();
-
     let z_tail: TailDm<bf16> = hop.to_dm(&mut ctx.tdma);
 
     // Sum of squares of the 240 scaled values of each slice, over H.
@@ -302,7 +277,8 @@ pub(crate) fn project_normalize_add(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![H / 4 % 60], m![H % 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &sw)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Fma), &rms_weight)
         .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &inv_rms_vrf)
         .vector_widen_concat::<m![H / 8 % 30], m![H % 8]>()
         .vector_clip(ClipBinaryOpF32::Add, &residual)
